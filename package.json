@@ -1,17 +1,22 @@
 {
   "name": "exam-grader-web",
   "private": true,
-  "version": "0.1.0-dev",
+  "version": "0.3.0-dev",
   "type": "module",
   "scripts": {
+    "version:sync": "node scripts/generate-version.mjs",
+    "predev": "npm run version:sync",
     "dev": "vite",
+    "prebuild": "npm run version:sync",
     "build": "vite build",
     "lint": "oxlint",
+    "pretest": "npm run version:sync",
     "test": "node --test",
     "preview": "vite preview"
   },
   "dependencies": {
     "@e965/xlsx": "^0.20.3",
+    "pdfjs-dist": "5.4.624",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "tesseract.js": "^7.0.0"

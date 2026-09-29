@@ -1,9 +1,25 @@
 import { useEffect, useRef, useState } from 'react'
+import * as pdfjsLib from 'pdfjs-dist'
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { parseOcrFields } from './parseOcrFields.js'
+import {
+  calculateOverallProgress,
+  getPdfRenderScale,
+  mergePdfPageTexts,
+} from './pdfOcrUtils.js'
+import { APP_VERSION } from './version.js'
 import './App.css'
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
 const imageErrorMessage =
   '圖片無法讀取或 OCR 辨識失敗，請確認檔案完整且清晰後再試。'
+const pdfErrorMessage =
+  'PDF 頁面無法讀取或 OCR 辨識失敗，請確認檔案未加密且內容清晰後再試。'
+const PDF_SIZE_ERROR = 'PDF_SIZE_ERROR'
+const PDF_PAGE_LIMIT_ERROR = 'PDF_PAGE_LIMIT_ERROR'
+const MAX_PDF_SIZE = 20 * 1024 * 1024
+const MAX_PDF_PAGES = 100
 
 function createResultRow(file, index) {
   const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name)
@@ -20,8 +36,9 @@ function createResultRow(file, index) {
     seatNumber: '—',
     studentName: '—',
     score: '—',
-    status: isPdf ? 'PDF 暫不支援' : isImage ? '待辨識' : '格式不支援',
+    status: isPdf || isImage ? '待辨識' : '格式不支援',
     error: '',
+    isPdf,
     isImage,
   }
 }
@@ -35,8 +52,15 @@ function App() {
     message: '',
     fileName: '',
     progress: null,
+    pageNumber: null,
+    totalPages: null,
+    pageProgress: null,
   })
   const activeWorkerRef = useRef(null)
+  const activePdfLoadingTaskRef = useRef(null)
+  const activePdfDocumentRef = useRef(null)
+  const activeRenderTaskRef = useRef(null)
+  const currentWorkRef = useRef(null)
   const ocrRunIdRef = useRef(0)
 
   useEffect(() => {
@@ -65,16 +89,37 @@ function App() {
       const worker = activeWorkerRef.current
       activeWorkerRef.current = null
       if (worker) void worker.terminate().catch(() => {})
+      activeRenderTaskRef.current?.cancel()
+      activeRenderTaskRef.current = null
+      const loadingTask = activePdfLoadingTaskRef.current
+      activePdfLoadingTaskRef.current = null
+      if (loadingTask) void loadingTask.destroy().catch(() => {})
+      const pdfDocument = activePdfDocumentRef.current
+      activePdfDocumentRef.current = null
+      if (pdfDocument) void pdfDocument.destroy().catch(() => {})
     },
     [],
   )
 
-  const handleFileChange = (event) => {
-    const worker = activeWorkerRef.current
-    const cancelledRun = ocrStatus.running
+  const cancelOcr = () => {
     ocrRunIdRef.current += 1
+    const worker = activeWorkerRef.current
     activeWorkerRef.current = null
     if (worker) void worker.terminate().catch(() => {})
+    activeRenderTaskRef.current?.cancel()
+    activeRenderTaskRef.current = null
+    const loadingTask = activePdfLoadingTaskRef.current
+    activePdfLoadingTaskRef.current = null
+    if (loadingTask) void loadingTask.destroy().catch(() => {})
+    const pdfDocument = activePdfDocumentRef.current
+    activePdfDocumentRef.current = null
+    if (pdfDocument) void pdfDocument.destroy().catch(() => {})
+    currentWorkRef.current = null
+  }
+
+  const handleFileChange = (event) => {
+    const cancelledRun = ocrStatus.running
+    cancelOcr()
 
     const files = Array.from(event.target.files ?? [])
     event.target.value = ''
@@ -85,6 +130,27 @@ function App() {
       message: cancelledRun ? '已取消前次辨識，請重新開始。' : '',
       fileName: '',
       progress: null,
+      pageNumber: null,
+      totalPages: null,
+      pageProgress: null,
+    })
+  }
+
+  const handleCancelOcr = () => {
+    cancelOcr()
+    setResultRows((rows) =>
+      rows.map((row) =>
+        row.status === '辨識中' ? { ...row, status: '待辨識', error: '' } : row,
+      ),
+    )
+    setOcrStatus({
+      running: false,
+      message: '已取消辨識，可重新開始或選擇其他檔案。',
+      fileName: '',
+      progress: null,
+      pageNumber: null,
+      totalPages: null,
+      pageProgress: null,
     })
   }
 
@@ -95,23 +161,26 @@ function App() {
   }
 
   const handleStartOcr = async () => {
-    const imageRows = resultRows.filter(
+    const ocrRows = resultRows.filter(
       (row) =>
-        row.isImage && ['待辨識', '辨識失敗'].includes(row.status),
+        (row.isImage || row.isPdf) &&
+        ['待辨識', '辨識失敗'].includes(row.status),
     )
-    if (imageRows.length === 0) return
+    if (ocrRows.length === 0) return
 
     const runId = ocrRunIdRef.current + 1
     ocrRunIdRef.current = runId
-    let activeFileName = imageRows[0].fileName
     let worker
     let failedCount = 0
 
     setOcrStatus({
       running: true,
       message: '正在載入 OCR 引擎與繁體中文辨識資料…',
-      fileName: activeFileName,
+      fileName: ocrRows[0].fileName,
       progress: 0,
+      pageNumber: null,
+      totalPages: null,
+      pageProgress: null,
     })
 
     try {
@@ -121,18 +190,33 @@ function App() {
         cacheMethod: 'none',
         logger: ({ status, progress }) => {
           if (ocrRunIdRef.current !== runId) return
+          const currentWork = currentWorkRef.current
+          const pageProgress = Math.round(progress * 100)
+          const fileProgress = currentWork
+            ? ((currentWork.pageNumber - 1 + progress) /
+                currentWork.totalPages) *
+              100
+            : progress * 100
           const message =
             status === 'recognizing text'
-              ? '正在辨識圖片…'
+              ? currentWork?.isPdf
+                ? `正在辨識 PDF 第 ${currentWork.pageNumber} 頁…`
+                : '正在辨識圖片…'
               : `正在載入 OCR 資料：${status}`
           setOcrStatus({
             running: true,
             message,
-            fileName: activeFileName,
-            progress:
-              status === 'recognizing text'
-                ? Math.round(progress * 100)
-                : null,
+            fileName: currentWork?.fileName ?? ocrRows[0].fileName,
+            progress: currentWork
+              ? calculateOverallProgress(
+                  currentWork.fileIndex,
+                  ocrRows.length,
+                  fileProgress,
+                )
+              : null,
+            pageNumber: currentWork?.isPdf ? currentWork.pageNumber : null,
+            totalPages: currentWork?.isPdf ? currentWork.totalPages : null,
+            pageProgress: currentWork?.isPdf ? pageProgress : null,
           })
         },
       })
@@ -143,34 +227,160 @@ function App() {
       }
       activeWorkerRef.current = worker
 
-      for (const row of imageRows) {
+      for (const [fileIndex, row] of ocrRows.entries()) {
         if (ocrRunIdRef.current !== runId) break
-        activeFileName = row.fileName
         updateRow(row.id, { status: '辨識中', error: '' })
         setOcrStatus({
           running: true,
-          message: '正在辨識圖片…',
-          fileName: activeFileName,
-          progress: 0,
+          message: row.isPdf ? '正在讀取 PDF…' : '正在辨識圖片…',
+          fileName: row.fileName,
+          progress: calculateOverallProgress(fileIndex, ocrRows.length),
+          pageNumber: null,
+          totalPages: null,
+          pageProgress: null,
         })
 
         try {
-          const {
-            data: { text },
-          } = await worker.recognize(row.file)
-          if (ocrRunIdRef.current !== runId) break
+          let text
+          let loadingTask
+          let pdfDocument
+          if (row.isPdf) {
+            if (row.file.size > MAX_PDF_SIZE) {
+              throw new Error(PDF_SIZE_ERROR)
+            }
+
+            const pdfData = await row.file.arrayBuffer()
+            if (ocrRunIdRef.current !== runId) break
+            loadingTask = pdfjsLib.getDocument({ data: pdfData })
+            activePdfLoadingTaskRef.current = loadingTask
+            pdfDocument = await loadingTask.promise
+            if (ocrRunIdRef.current !== runId) break
+            activePdfLoadingTaskRef.current = null
+            activePdfDocumentRef.current = pdfDocument
+
+            if (pdfDocument.numPages > MAX_PDF_PAGES) {
+              throw new Error(PDF_PAGE_LIMIT_ERROR)
+            }
+
+            const pageTexts = []
+            for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
+              if (ocrRunIdRef.current !== runId) break
+              const page = await pdfDocument.getPage(pageNumber)
+              let canvas
+              let renderTask
+              try {
+                if (ocrRunIdRef.current !== runId) break
+                const initialViewport = page.getViewport({ scale: 1 })
+                const scale = getPdfRenderScale(
+                  initialViewport.width,
+                  initialViewport.height,
+                )
+                const viewport = page.getViewport({ scale })
+                canvas = document.createElement('canvas')
+                canvas.width = Math.ceil(viewport.width)
+                canvas.height = Math.ceil(viewport.height)
+                const context = canvas.getContext('2d')
+                if (!context) throw new Error('Canvas 不支援')
+                currentWorkRef.current = {
+                  fileName: row.fileName,
+                  fileIndex,
+                  isPdf: true,
+                  pageNumber,
+                  runId,
+                  totalPages: pdfDocument.numPages,
+                }
+                setOcrStatus({
+                  running: true,
+                  message: `正在轉換 PDF 第 ${pageNumber} 頁…`,
+                  fileName: row.fileName,
+                  progress: calculateOverallProgress(
+                    fileIndex,
+                    ocrRows.length,
+                    ((pageNumber - 1) / pdfDocument.numPages) * 100,
+                  ),
+                  pageNumber,
+                  totalPages: pdfDocument.numPages,
+                  pageProgress: 0,
+                })
+                renderTask = page.render({
+                  canvasContext: context,
+                  viewport,
+                })
+                activeRenderTaskRef.current = renderTask
+                await renderTask.promise
+                if (activeRenderTaskRef.current === renderTask) {
+                  activeRenderTaskRef.current = null
+                }
+                if (ocrRunIdRef.current !== runId) break
+                const {
+                  data: { text: pageText },
+                } = await worker.recognize(canvas)
+                if (ocrRunIdRef.current !== runId) break
+                pageTexts.push(pageText)
+              } finally {
+                if (canvas) {
+                  canvas.width = 0
+                  canvas.height = 0
+                }
+                page.cleanup()
+                if (activeRenderTaskRef.current === renderTask) {
+                  activeRenderTaskRef.current = null
+                }
+              }
+            }
+            if (ocrRunIdRef.current !== runId) break
+            text = mergePdfPageTexts(pageTexts)
+          } else {
+            currentWorkRef.current = {
+              fileName: row.fileName,
+              fileIndex,
+              isPdf: false,
+              pageNumber: 1,
+              runId,
+              totalPages: 1,
+            }
+            const result = await worker.recognize(row.file)
+            if (ocrRunIdRef.current !== runId) break
+            text = result.data.text
+          }
+
           updateRow(row.id, {
             ...parseOcrFields(text),
             status: '待確認',
             error: '',
           })
-        } catch {
+        } catch (error) {
           if (ocrRunIdRef.current !== runId) break
           failedCount += 1
           updateRow(row.id, {
             status: '辨識失敗',
-            error: imageErrorMessage,
+            error: row.isPdf
+              ? error?.message === PDF_SIZE_ERROR
+                ? 'PDF 檔案超過 20 MB，請縮小檔案後再試。'
+                : error?.message === PDF_PAGE_LIMIT_ERROR
+                  ? 'PDF 超過 100 頁，請拆分檔案後再試。'
+                  : pdfErrorMessage
+              : imageErrorMessage,
           })
+        } finally {
+          if (currentWorkRef.current?.runId === runId) {
+            currentWorkRef.current = null
+          }
+          if (activePdfLoadingTaskRef.current === loadingTask) {
+            activePdfLoadingTaskRef.current = null
+          }
+          if (activePdfDocumentRef.current === pdfDocument) {
+            activePdfDocumentRef.current = null
+          }
+          if (pdfDocument) {
+            try {
+              await pdfDocument.destroy()
+            } catch {}
+          } else if (loadingTask) {
+            try {
+              await loadingTask.destroy()
+            } catch {}
+          }
         }
       }
 
@@ -179,27 +389,31 @@ function App() {
           running: false,
           message:
             failedCount > 0
-              ? `辨識作業完成，有 ${failedCount} 個圖片檔辨識失敗，請查看各列提示或重試。`
-              : '圖片辨識完成，請逐筆人工確認結果。',
+              ? `辨識作業完成，有 ${failedCount} 個檔案辨識失敗，請查看各列提示或重試。`
+              : '辨識完成，請逐筆人工確認結果。',
           fileName: '',
-          progress: null,
+          progress: 100,
+          pageNumber: null,
+          totalPages: null,
+          pageProgress: null,
         })
       }
     } catch {
       if (ocrRunIdRef.current === runId) {
-        for (const row of imageRows) {
-          if (row.status !== '待確認') {
-            updateRow(row.id, {
-              status: '辨識失敗',
-              error: 'OCR 引擎啟動失敗，請確認網路連線後再試。',
-            })
-          }
+        for (const row of ocrRows) {
+          updateRow(row.id, {
+            status: '辨識失敗',
+            error: 'OCR 引擎啟動失敗，請確認網路連線後再試。',
+          })
         }
         setOcrStatus({
           running: false,
           message: 'OCR 引擎啟動失敗，請確認網路連線後再試。',
           fileName: '',
           progress: null,
+          pageNumber: null,
+          totalPages: null,
+          pageProgress: null,
         })
       }
     } finally {
@@ -246,7 +460,8 @@ function App() {
 
   const hasOcrCandidates = resultRows.some(
     (row) =>
-      row.isImage && ['待辨識', '辨識失敗'].includes(row.status),
+      (row.isImage || row.isPdf) &&
+      ['待辨識', '辨識失敗'].includes(row.status),
   )
 
   return (
@@ -264,8 +479,7 @@ function App() {
           onChange={handleFileChange}
         />
         <p className="hint">
-          支援格式：JPG、JPEG、PNG、PDF。第一版 OCR 僅支援 JPG、JPEG、PNG
-          圖片；PDF 可匯出結果，但尚未支援 OCR。
+          支援格式：JPG、JPEG、PNG、PDF。PDF 限制為 20 MB、最多 100 頁；系統會逐頁轉換與辨識。
         </p>
       </section>
 
@@ -295,6 +509,11 @@ function App() {
             >
               開始 OCR
             </button>
+            {ocrStatus.running && (
+              <button type="button" onClick={handleCancelOcr}>
+                取消辨識
+              </button>
+            )}
             <button
               type="button"
               onClick={handleExport}
@@ -310,7 +529,10 @@ function App() {
             <>
               {' '}
               目前處理：{ocrStatus.fileName}
-              {ocrStatus.progress !== null && `（${ocrStatus.progress}%）`}
+              {ocrStatus.pageNumber !== null &&
+                `（第 ${ocrStatus.pageNumber} / ${ocrStatus.totalPages} 頁${ocrStatus.pageProgress !== null ? `，本頁 ${ocrStatus.pageProgress}%` : ''}）`}
+              {ocrStatus.progress !== null &&
+                `（整體進度 ${ocrStatus.progress}%）`}
             </>
           )}
         </p>
@@ -393,8 +615,9 @@ function App() {
         <h2>使用注意事項</h2>
         <ul>
           <li>
-            第一版 OCR 僅辨識 JPG、JPEG、PNG 圖片中的印刷文字，不支援 PDF 或手寫辨識。
+            支援 JPG、JPEG、PNG 與 PDF。PDF 會逐頁渲染成影像後辨識，文字型與掃描圖片型 PDF 均不使用 PDF 文字層。
           </li>
+          <li>PDF 檔案上限為 20 MB、100 頁；頁面依序處理並釋放影像，可隨時取消或重試。</li>
           <li>
             辨識準確度會受圖片清晰度、方向、版面與文字影響，OCR
             結果皆須人工確認。
@@ -409,12 +632,12 @@ function App() {
       <section className="card">
         <h2>隱私說明</h2>
         <p>
-          考卷圖片與 OCR 結果只在瀏覽器記憶體中處理，不會上傳考卷或結果，也不使用
-          localStorage。首次辨識時，瀏覽器會從 jsDelivr 載入 OCR 引擎與語言資料；圖片和辨識結果不會傳送給該服務。
+          PDF／圖片與 OCR 結果只在瀏覽器記憶體中處理，不會上傳考卷或結果，也不使用
+          localStorage。PDF.js 與 worker 隨網站部署；首次辨識時，瀏覽器會從 jsDelivr 載入 Tesseract.js OCR 引擎與語言資料。CDN 僅提供程式及語言資源，檔案內容與 OCR 結果不會傳送給 CDN。
         </p>
       </section>
 
-      <div className="version">v0.1.0-dev</div>
+      <div className="version">{APP_VERSION}</div>
     </main>
   )
 }
