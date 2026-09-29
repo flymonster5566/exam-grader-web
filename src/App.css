@@ -31,7 +31,13 @@ h1 {
   flex-wrap: wrap;
 }
 
-.results-header button {
+.result-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.result-actions button {
   padding: 8px 14px;
   border: 0;
   border-radius: 6px;
@@ -41,18 +47,23 @@ h1 {
   cursor: pointer;
 }
 
-.results-header button:hover:not(:disabled) {
+.result-actions button:hover:not(:disabled) {
   background: #1d4ed8;
 }
 
-.results-header button:focus-visible {
+.result-actions button:focus-visible {
   outline: 3px solid #93c5fd;
   outline-offset: 2px;
 }
 
-.results-header button:disabled {
+.result-actions button:disabled {
   background: #9ca3af;
   cursor: not-allowed;
+}
+
+.ocr-progress {
+  min-height: 24px;
+  margin: 12px 0;
 }
 
 .export-message {
@@ -83,6 +94,7 @@ ul {
 
 table {
   width: 100%;
+  min-width: 720px;
   border-collapse: collapse;
   font-size: 14px;
 }
@@ -96,6 +108,26 @@ td {
 
 th {
   background: #f3f4f6;
+}
+
+td input {
+  width: 100%;
+  min-width: 72px;
+  padding: 6px;
+  border: 1px solid #9ca3af;
+  border-radius: 4px;
+  font: inherit;
+}
+
+td input:focus-visible {
+  outline: 3px solid #93c5fd;
+  outline-offset: 1px;
+}
+
+.row-error {
+  display: block;
+  margin-top: 4px;
+  color: #b91c1c;
 }
 
 .version {
