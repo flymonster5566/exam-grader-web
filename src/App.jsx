@@ -467,14 +467,31 @@ function App() {
     }
   }
 
+  const parsedAnswerKey = useMemo(
+    () => parseAnswerKey(answerKeyText),
+    [answerKeyText],
+  )
+  const pointsResult = useMemo(
+    () => parsePointsPerQuestion(pointsPerQuestionText),
+    [pointsPerQuestionText],
+  )
+  const gradingByRowId = useMemo(
+    () =>
+      new Map(
+        resultRows.map((row) => [
+          row.id,
+          gradeRow(row, parsedAnswerKey, pointsResult.points),
+        ]),
+      ),
+    [resultRows, parsedAnswerKey, pointsResult],
+  )
+
   const handleExport = () => {
     try {
       const now = new Date()
-      const exportAnswerKey = parseAnswerKey(answerKeyText)
-      const exportPoints = parsePointsPerQuestion(pointsPerQuestionText)
       const worksheet = xlsxModule.utils.json_to_sheet(
         resultRows.map((row) =>
-          buildExportRow(row, exportAnswerKey, exportPoints.points),
+          buildExportRow(row, parsedAnswerKey, pointsResult.points),
         ),
       )
       const workbook = xlsxModule.utils.book_new()
@@ -500,25 +517,6 @@ function App() {
     (row) =>
       (row.isImage || row.isPdf) &&
       ['待辨識', '辨識失敗'].includes(row.status),
-  )
-
-  const parsedAnswerKey = useMemo(
-    () => parseAnswerKey(answerKeyText),
-    [answerKeyText],
-  )
-  const pointsResult = useMemo(
-    () => parsePointsPerQuestion(pointsPerQuestionText),
-    [pointsPerQuestionText],
-  )
-  const gradingByRowId = useMemo(
-    () =>
-      new Map(
-        resultRows.map((row) => [
-          row.id,
-          gradeRow(row, parsedAnswerKey, pointsResult.points),
-        ]),
-      ),
-    [resultRows, parsedAnswerKey, pointsResult],
   )
 
   return (
