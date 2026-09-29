@@ -23,6 +23,50 @@ h1 {
   margin-bottom: 12px;
 }
 
+.results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.results-header button {
+  padding: 8px 14px;
+  border: 0;
+  border-radius: 6px;
+  color: #ffffff;
+  background: #2563eb;
+  font: inherit;
+  cursor: pointer;
+}
+
+.results-header button:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+
+.results-header button:focus-visible {
+  outline: 3px solid #93c5fd;
+  outline-offset: 2px;
+}
+
+.results-header button:disabled {
+  background: #9ca3af;
+  cursor: not-allowed;
+}
+
+.export-message {
+  margin: 0 0 12px;
+}
+
+.export-message.success {
+  color: #166534;
+}
+
+.export-message.error {
+  color: #b91c1c;
+}
+
 .hint {
   margin-top: 8px;
   color: #4b5563;
