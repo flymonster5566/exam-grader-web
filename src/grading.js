@@ -1,6 +1,7 @@
 const VALID_ANSWERS = ['A', 'B', 'C', 'D']
 const ANSWER_KEY_LINE = /^(\d+)\s*[:：]\s*(.*)$/
 const STUDENT_ANSWER_TOKEN = /(\d+)\s*[:：]\s*([A-Da-d])/g
+const MAX_QUESTION_NUMBER = 1000
 
 /**
  * Parses a standard answer key of the form:
@@ -37,8 +38,14 @@ export function parseAnswerKey(rawText) {
     }
 
     const questionNumber = Number(match[1])
-    encounteredQuestionNumbers.add(questionNumber)
     const rawAnswer = match[2].trim()
+    const isDuplicate = seen.has(questionNumber)
+    encounteredQuestionNumbers.add(questionNumber)
+
+    if (isDuplicate) {
+      errors.push(`第 ${questionNumber} 題重複設定標準答案。`)
+      return
+    }
 
     if (!rawAnswer) {
       errors.push(`第 ${questionNumber} 題未填寫答案。`)
@@ -53,19 +60,23 @@ export function parseAnswerKey(rawText) {
       return
     }
 
-    if (seen.has(questionNumber)) {
-      errors.push(`第 ${questionNumber} 題重複設定標準答案。`)
-      return
-    }
-
     seen.set(questionNumber, answer)
   })
 
   if (encounteredQuestionNumbers.size > 0) {
-    const maxQuestion = Math.max(...encounteredQuestionNumbers)
-    for (let questionNumber = 1; questionNumber <= maxQuestion; questionNumber += 1) {
-      if (!encounteredQuestionNumbers.has(questionNumber)) {
-        errors.push(`缺少第 ${questionNumber} 題標準答案。`)
+    const maxQuestion = [...encounteredQuestionNumbers].reduce(
+      (max, questionNumber) => Math.max(max, questionNumber),
+      0,
+    )
+    if (maxQuestion > MAX_QUESTION_NUMBER) {
+      errors.push(
+        `題號超出可處理範圍，請確認題號是否正確（僅支援 1 到 ${MAX_QUESTION_NUMBER} 題）。`,
+      )
+    } else {
+      for (let questionNumber = 1; questionNumber <= maxQuestion; questionNumber += 1) {
+        if (!encounteredQuestionNumbers.has(questionNumber)) {
+          errors.push(`缺少第 ${questionNumber} 題標準答案。`)
+        }
       }
     }
   }

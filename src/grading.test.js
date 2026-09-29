@@ -55,10 +55,23 @@ test('rejects duplicate question numbers', () => {
   assert.ok(result.errors.some((message) => message.includes('第 1 題重複設定')))
 })
 
+test('reports duplicate question numbers even when the later occurrence has an invalid answer', () => {
+  const result = parseAnswerKey('1:A\n1:E')
+  assert.equal(result.isValid, false)
+  assert.ok(result.errors.some((message) => message.includes('第 1 題重複設定')))
+})
+
 test('rejects missing question numbers in sequence', () => {
   const result = parseAnswerKey('1:A\n3:B')
   assert.equal(result.isValid, false)
   assert.ok(result.errors.some((message) => message.includes('缺少第 2 題標準答案')))
+})
+
+test('rejects an out-of-range question number without enumerating every missing question', () => {
+  const result = parseAnswerKey('1:A\n99999:B')
+  assert.equal(result.isValid, false)
+  assert.ok(result.errors.some((message) => message.includes('題號超出可處理範圍')))
+  assert.ok(!result.errors.some((message) => message.includes('缺少第')))
 })
 
 test('rejects blank answers and empty input', () => {
