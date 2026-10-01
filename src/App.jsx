@@ -122,6 +122,45 @@ function createOcrWorker(createWorker, options) {
   return Promise.race([workerPromise, startupFailure])
 }
 
+// Attempts to start the OCR worker using same-site assets first, falling
+// back to the default CDN options (at most once, via `shouldAttemptCdnFallback`)
+// only if the same-site attempt failed. Returns the worker on success, or
+// throws the last error if both attempts failed.
+async function startOcrWorkerWithFallback({
+  createWorker,
+  baseUrl,
+  logger,
+  onFallbackStart,
+}) {
+  const sameSiteOptions = buildSameSiteWorkerOptions(baseUrl)
+  let fallbackAttempted = false
+  let lastError = null
+  try {
+    return await createOcrWorker(createWorker, {
+      cacheMethod: 'none',
+      ...sameSiteOptions,
+      logger,
+    })
+  } catch (sameSiteError) {
+    lastError = sameSiteError
+  }
+
+  if (shouldAttemptCdnFallback({ sameSiteFailed: true, fallbackAttempted })) {
+    fallbackAttempted = true
+    onFallbackStart?.(lastError)
+    try {
+      return await createOcrWorker(createWorker, {
+        cacheMethod: 'none',
+        logger,
+      })
+    } catch (fallbackError) {
+      lastError = fallbackError
+    }
+  }
+
+  throw lastError
+}
+
 function App() {
   const [resultRows, setResultRows] = useState([])
   const [exportStatus, setExportStatus] = useState(null)
@@ -305,45 +344,28 @@ function App() {
         })
       }
 
-      const sameSiteOptions = buildSameSiteWorkerOptions(import.meta.env.BASE_URL)
       let startupError = null
       try {
-        worker = await createOcrWorker(createWorker, {
-          cacheMethod: 'none',
-          ...sameSiteOptions,
+        worker = await startOcrWorkerWithFallback({
+          createWorker,
+          baseUrl: import.meta.env.BASE_URL,
           logger: ocrWorkerLogger,
+          onFallbackStart: (sameSiteError) => {
+            if (ocrRunIdRef.current !== runId) return
+            console.error('同站 OCR 資源載入失敗，改嘗試 CDN 備援資源。', sameSiteError)
+            setOcrStatus({
+              running: true,
+              message: '同站 OCR 資源載入失敗，正在嘗試備援 OCR 資源（CDN）…',
+              fileName: ocrRows[0].fileName,
+              progress: 0,
+              pageNumber: null,
+              totalPages: null,
+              pageProgress: null,
+            })
+          },
         })
-      } catch (sameSiteError) {
-        startupError = sameSiteError
-      }
-
-      if (
-        !worker &&
-        shouldAttemptCdnFallback({
-          sameSiteFailed: Boolean(startupError),
-          fallbackAttempted: false,
-        })
-      ) {
-        if (ocrRunIdRef.current !== runId) return
-        console.error('同站 OCR 資源載入失敗，改嘗試 CDN 備援資源。', startupError)
-        setOcrStatus({
-          running: true,
-          message: '同站 OCR 資源載入失敗，正在嘗試備援 OCR 資源（CDN）…',
-          fileName: ocrRows[0].fileName,
-          progress: 0,
-          pageNumber: null,
-          totalPages: null,
-          pageProgress: null,
-        })
-        try {
-          worker = await createOcrWorker(createWorker, {
-            cacheMethod: 'none',
-            logger: ocrWorkerLogger,
-          })
-          startupError = null
-        } catch (fallbackError) {
-          startupError = fallbackError
-        }
+      } catch (error) {
+        startupError = error
       }
 
       ocrStartupSettled = true
