@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module'
-import { copyFile, mkdir, rm } from 'node:fs/promises'
+import { copyFile, mkdir, readdir, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -34,9 +34,34 @@ async function copyInto(sourcePath, destDir, destFileName = path.basename(source
   } catch (error) {
     throw new Error(
       `無法複製 OCR 資源檔案 "${sourcePath}"。這可能表示已安裝的套件版本內部目錄結構` +
-        `（例如語言資料的 "4.0.0_best_int" 子目錄）已變更，需要更新本腳本。原始錯誤：${error.message}`,
+        `已變更，需要更新本腳本。原始錯誤：${error.message}`,
     )
   }
+}
+
+// The LSTM-only "best_int" traineddata lives under a version-prefixed
+// directory (e.g. "4.0.0_best_int"). Rather than hardcoding the version
+// (which would silently break on a routine package update), discover it by
+// name pattern so a minor/patch bump in `@tesseract.js-data/*` keeps working.
+async function findBestIntDir(packageRoot) {
+  let entries
+  try {
+    entries = await readdir(packageRoot, { withFileTypes: true })
+  } catch (error) {
+    throw new Error(
+      `無法讀取 OCR 語言資料套件目錄 "${packageRoot}"。原始錯誤：${error.message}`,
+    )
+  }
+  const match = entries.find(
+    (entry) => entry.isDirectory() && entry.name.endsWith('_best_int'),
+  )
+  if (!match) {
+    throw new Error(
+      `在 "${packageRoot}" 中找不到 "*_best_int" 語言資料目錄。這表示已安裝的套件` +
+        `版本內部目錄結構已變更，需要更新本腳本以符合新的套件結構。`,
+    )
+  }
+  return path.join(packageRoot, match.name)
 }
 
 async function main() {
@@ -63,10 +88,8 @@ async function main() {
 
   const langDestDir = path.join(ocrPublicDir, 'lang')
   for (const lang of ['chi_tra', 'eng']) {
-    const langDataDir = path.join(
-      packageDir(`@tesseract.js-data/${lang}/package.json`),
-      '4.0.0_best_int',
-    )
+    const packageRoot = packageDir(`@tesseract.js-data/${lang}/package.json`)
+    const langDataDir = await findBestIntDir(packageRoot)
     await copyInto(
       path.join(langDataDir, `${lang}.traineddata.gz`),
       langDestDir,
