@@ -65,6 +65,10 @@ async function findBestIntDir(packageRoot) {
 }
 
 async function main() {
+  // Not safe to run concurrently with another invocation of this script
+  // (e.g. `npm run dev` and `npm run test` started at the same time), since
+  // one process could delete `public/ocr` while another reads from it. This
+  // is fine for the expected single-process local dev/CI workflow.
   await rm(ocrPublicDir, { recursive: true, force: true })
 
   const tesseractJsDistDir = path.join(

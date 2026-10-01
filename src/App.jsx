@@ -93,18 +93,24 @@ function buildExportRow(row, parsedAnswerKey, pointsPerQuestion) {
 // rejection ensures language load failures (and any other worker-reported
 // error) surface instead of hanging indefinitely.
 function createOcrWorker(createWorker, options) {
-  let rejectStartup
   let startupRejected = false
+  // Set synchronously inside the rejecting call itself (rather than relying
+  // on `startupFailure`'s `.catch()` callback having already run) so the
+  // flag is correct even if `workerPromise` resolves in the same microtask
+  // tick as the rejection.
+  const rejectStartup = (error) => {
+    startupRejected = true
+    rejectStartupPromise(error)
+  }
+  let rejectStartupPromise
   const startupFailure = new Promise((_resolve, reject) => {
-    rejectStartup = reject
+    rejectStartupPromise = reject
   })
   // If the worker starts successfully, `startupFailure` has already lost the
   // race below but keeps living (the `errorHandler` option stays attached
   // for the worker's full lifetime). Without this, a later job failure could
   // reject it with nothing listening, producing an unhandled rejection.
-  startupFailure.catch(() => {
-    startupRejected = true
-  })
+  startupFailure.catch(() => {})
   const workerPromise = createWorker(['chi_tra', 'eng'], undefined, {
     ...options,
     errorHandler: (error) => rejectStartup(error),
