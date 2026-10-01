@@ -16,12 +16,27 @@ const projectRoot = fileURLToPath(new URL('..', import.meta.url))
 const ocrPublicDir = path.join(projectRoot, 'public', 'ocr')
 
 function packageDir(packageJsonSpecifier) {
-  return path.dirname(require.resolve(packageJsonSpecifier))
+  try {
+    return path.dirname(require.resolve(packageJsonSpecifier))
+  } catch (error) {
+    throw new Error(
+      `無法找到 OCR 資源套件 "${packageJsonSpecifier}"。請確認已執行 npm install，` +
+        `且 package.json 中列有對應的 devDependency（例如 tesseract.js-core、` +
+        `@tesseract.js-data/chi_tra、@tesseract.js-data/eng）。原始錯誤：${error.message}`,
+    )
+  }
 }
 
 async function copyInto(sourcePath, destDir, destFileName = path.basename(sourcePath)) {
   await mkdir(destDir, { recursive: true })
-  await copyFile(sourcePath, path.join(destDir, destFileName))
+  try {
+    await copyFile(sourcePath, path.join(destDir, destFileName))
+  } catch (error) {
+    throw new Error(
+      `無法複製 OCR 資源檔案 "${sourcePath}"。這可能表示已安裝的套件版本內部目錄結構` +
+        `（例如語言資料的 "4.0.0_best_int" 子目錄）已變更，需要更新本腳本。原始錯誤：${error.message}`,
+    )
+  }
 }
 
 async function main() {

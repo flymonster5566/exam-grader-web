@@ -97,6 +97,11 @@ function createOcrWorker(createWorker, options) {
   const startupFailure = new Promise((_resolve, reject) => {
     rejectStartup = reject
   })
+  // If the worker starts successfully, `startupFailure` has already lost the
+  // race below but keeps living (the `errorHandler` option stays attached
+  // for the worker's full lifetime). Without this, a later job failure could
+  // reject it with nothing listening, producing an unhandled rejection.
+  startupFailure.catch(() => {})
   const workerPromise = createWorker(['chi_tra', 'eng'], undefined, {
     ...options,
     errorHandler: (error) => rejectStartup(error),
