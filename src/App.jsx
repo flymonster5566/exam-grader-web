@@ -654,6 +654,10 @@ function App() {
             if (gridMode) {
               gridSourceCanvas = await loadImageFileToCanvas(row.file)
               if (ocrRunIdRef.current !== runId) break
+              // Full-page recognition is still needed here (separately from
+              // the per-cell grid OCR below) purely to extract the
+              // 班級/座號/姓名 header fields via `parseOcrFields`; the grid
+              // cells are never read from this pass.
               const { data } = await worker.recognize(gridSourceCanvas)
               text = data.text
             } else {
@@ -927,7 +931,6 @@ function App() {
       })
     }
   }
-
 
   const hasOcrCandidates = resultRows.some(
     (row) =>
