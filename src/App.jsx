@@ -16,6 +16,13 @@ import {
   parseStudentAnswers,
 } from './grading.js'
 import {
+  computeGridCellPixelRects,
+  createGridLayout,
+  gridAnswersToText,
+  parseGridAnswerResults,
+} from './gridAnswerSheet.js'
+import { computeStatistics, formatStatisticsSummary } from './gradingStatistics.js'
+import {
   buildSameSiteWorkerOptions,
   classifyOcrStartupError,
   shouldAttemptCdnFallback,
@@ -33,6 +40,15 @@ const PDF_SIZE_ERROR = 'PDF_SIZE_ERROR'
 const PDF_PAGE_LIMIT_ERROR = 'PDF_PAGE_LIMIT_ERROR'
 const MAX_PDF_SIZE = 20 * 1024 * 1024
 const MAX_PDF_PAGES = 100
+const DEFAULT_GRID_TOTAL_QUESTIONS = '20'
+const DEFAULT_GRID_COLUMNS = '5'
+const GRID_ANSWER_CHAR_WHITELIST = 'ABCD'
+const gridLayoutErrorMessage =
+  '固定格子版面設定錯誤，請確認總題數與每列格數皆為正整數。'
+const gridLocateErrorMessage =
+  '固定格子答案紙版面定位失敗，請確認影像完整、方向正確且清晰後再試。'
+const gridCellErrorMessage =
+  '部分格子辨識失敗，已標示為待確認，請人工檢查後再試一次。'
 
 function createResultRow(file, index) {
   const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name)
@@ -49,6 +65,7 @@ function createResultRow(file, index) {
     seatNumber: '—',
     studentName: '—',
     studentAnswersText: '',
+    pendingQuestions: [],
     status: isPdf || isImage ? '待辨識' : '格式不支援',
     error: '',
     isPdf,
@@ -66,8 +83,11 @@ function gradeRow(row, parsedAnswerKey, pointsPerQuestion) {
 }
 
 function displayRowStatus(row, grading) {
-  if (row.status === '待確認' && grading) return '已計分'
-  return row.status
+  const base = row.status === '待確認' && grading ? '已計分' : row.status
+  if (row.pendingQuestions && row.pendingQuestions.length > 0) {
+    return `${base}（待確認第${row.pendingQuestions.join('、')}題）`
+  }
+  return base
 }
 
 function buildExportRow(row, parsedAnswerKey, pointsPerQuestion) {
@@ -81,6 +101,11 @@ function buildExportRow(row, parsedAnswerKey, pointsPerQuestion) {
     答對題數: grading ? grading.correctCount : '—',
     總題數: grading ? grading.totalCount : '—',
     學生答案: row.studentAnswersText || '—',
+    標準答案: parsedAnswerKey.isValid
+      ? [...parsedAnswerKey.answerKey.entries()]
+          .map(([questionNumber, answer]) => `${questionNumber}:${answer}`)
+          .join('、')
+      : '—',
     錯題清單: grading ? formatWrongQuestions(grading.wrongQuestions) : '—',
     狀態: displayRowStatus(row, grading),
   }
@@ -167,12 +192,109 @@ async function startOcrWorkerWithFallback({
   throw lastError
 }
 
+// Loads an image File into an off-screen canvas so it can be cropped into
+// per-question cells for grid OCR (the existing free-text flow passes image
+// Files straight to `worker.recognize`, which doesn't expose pixel
+// dimensions needed for cropping).
+function loadImageFileToCanvas(file) {
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(file)
+    const image = new Image()
+    image.onload = () => {
+      try {
+        const canvas = document.createElement('canvas')
+        canvas.width = image.naturalWidth
+        canvas.height = image.naturalHeight
+        const context = canvas.getContext('2d')
+        if (!context) throw new Error('Canvas 不支援')
+        context.drawImage(image, 0, 0)
+        resolve(canvas)
+      } catch (error) {
+        reject(error)
+      } finally {
+        URL.revokeObjectURL(objectUrl)
+      }
+    }
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl)
+      reject(new Error(gridLocateErrorMessage))
+    }
+    image.src = objectUrl
+  })
+}
+
+// Crops one grid cell out of a full answer-sheet canvas into its own small
+// canvas, for isolated single-character OCR.
+function cropCanvasCell(sourceCanvas, rect) {
+  const cellCanvas = document.createElement('canvas')
+  cellCanvas.width = rect.width
+  cellCanvas.height = rect.height
+  const context = cellCanvas.getContext('2d')
+  if (!context) throw new Error('Canvas 不支援')
+  context.drawImage(
+    sourceCanvas,
+    rect.x,
+    rect.y,
+    rect.width,
+    rect.height,
+    0,
+    0,
+    rect.width,
+    rect.height,
+  )
+  return cellCanvas
+}
+
+// Runs the fixed-grid OCR flow on a full answer-sheet canvas: locates every
+// cell via `layout`, OCRs each cell in isolation restricted to A/B/C/D, and
+// returns the parsed answers/blank/pending questions (see
+// `parseGridAnswerResults` in gridAnswerSheet.js for the no-guessing rules).
+async function recognizeGridCells(worker, canvas, layout) {
+  let cellRects
+  try {
+    cellRects = computeGridCellPixelRects(layout, canvas.width, canvas.height)
+  } catch (error) {
+    throw new Error(gridLocateErrorMessage, { cause: error })
+  }
+
+  await worker.setParameters({ tessedit_char_whitelist: GRID_ANSWER_CHAR_WHITELIST })
+  try {
+    const cellResults = []
+    for (const rect of cellRects) {
+      try {
+        const cellCanvas = cropCanvasCell(canvas, rect)
+        const { data } = await worker.recognize(cellCanvas)
+        cellResults.push({
+          questionNumber: rect.questionNumber,
+          text: data.text,
+          confidence: data.confidence,
+        })
+      } catch {
+        // A single cell failing to OCR must not abort the whole sheet; treat
+        // it as unclear so it is surfaced as "待確認" instead of silently
+        // dropped or guessed.
+        cellResults.push({ questionNumber: rect.questionNumber, text: '?', confidence: 0 })
+      }
+    }
+    return parseGridAnswerResults(cellResults)
+  } finally {
+    await worker.setParameters({ tessedit_char_whitelist: '' })
+  }
+}
+
 function App() {
   const [resultRows, setResultRows] = useState([])
   const [exportStatus, setExportStatus] = useState(null)
   const [xlsxModule, setXlsxModule] = useState(null)
   const [answerKeyText, setAnswerKeyText] = useState('')
   const [pointsPerQuestionText, setPointsPerQuestionText] = useState('1')
+  const [gridMode, setGridMode] = useState(false)
+  const [gridTotalQuestionsText, setGridTotalQuestionsText] = useState(
+    DEFAULT_GRID_TOTAL_QUESTIONS,
+  )
+  const [gridColumnsText, setGridColumnsText] = useState(DEFAULT_GRID_COLUMNS)
+  const [standardSheetFile, setStandardSheetFile] = useState(null)
+  const [standardSheetStatus, setStandardSheetStatus] = useState(null)
   const [ocrStatus, setOcrStatus] = useState({
     running: false,
     message: '',
@@ -294,6 +416,29 @@ function App() {
     )
     if (ocrRows.length === 0) return
 
+    let gridLayoutResult = null
+    if (gridMode) {
+      try {
+        gridLayoutResult = {
+          layout: createGridLayout({
+            totalQuestions: Number(gridTotalQuestionsText),
+            columns: Number(gridColumnsText),
+          }),
+        }
+      } catch {
+        setOcrStatus({
+          running: false,
+          message: gridLayoutErrorMessage,
+          fileName: '',
+          progress: null,
+          pageNumber: null,
+          totalPages: null,
+          pageProgress: null,
+        })
+        return
+      }
+    }
+
     const runId = ocrRunIdRef.current + 1
     ocrRunIdRef.current = runId
     let worker
@@ -399,6 +544,7 @@ function App() {
         let text
         let loadingTask
         let pdfDocument
+        let gridSourceCanvas
         try {
           if (row.isPdf) {
             if (row.file.size > MAX_PDF_SIZE) {
@@ -418,8 +564,12 @@ function App() {
               throw new Error(PDF_PAGE_LIMIT_ERROR)
             }
 
+            // Fixed-grid answer sheets are a single page; only the first
+            // page is rendered/recognized in grid mode.
+            const pagesToProcess = gridMode ? 1 : pdfDocument.numPages
+
             const pageTexts = []
-            for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
+            for (let pageNumber = 1; pageNumber <= pagesToProcess; pageNumber += 1) {
               if (ocrRunIdRef.current !== runId) break
               const page = await pdfDocument.getPage(pageNumber)
               let canvas
@@ -468,6 +618,12 @@ function App() {
                   activeRenderTaskRef.current = null
                 }
                 if (ocrRunIdRef.current !== runId) break
+                if (gridMode && pageNumber === 1) {
+                  gridSourceCanvas = document.createElement('canvas')
+                  gridSourceCanvas.width = canvas.width
+                  gridSourceCanvas.height = canvas.height
+                  gridSourceCanvas.getContext('2d').drawImage(canvas, 0, 0)
+                }
                 const {
                   data: { text: pageText },
                 } = await worker.recognize(canvas)
@@ -495,29 +651,59 @@ function App() {
               runId,
               totalPages: 1,
             }
-            const result = await worker.recognize(row.file)
+            if (gridMode) {
+              gridSourceCanvas = await loadImageFileToCanvas(row.file)
+              if (ocrRunIdRef.current !== runId) break
+              // Full-page recognition is still needed here (separately from
+              // the per-cell grid OCR below) purely to extract the
+              // 班級/座號/姓名 header fields via `parseOcrFields`; the grid
+              // cells are never read from this pass.
+              const { data } = await worker.recognize(gridSourceCanvas)
+              text = data.text
+            } else {
+              const result = await worker.recognize(row.file)
+              text = result.data.text
+            }
             if (ocrRunIdRef.current !== runId) break
-            text = result.data.text
+          }
+
+          let gridAnswersResult = null
+          if (gridMode && gridSourceCanvas) {
+            gridAnswersResult = await recognizeGridCells(
+              worker,
+              gridSourceCanvas,
+              gridLayoutResult.layout,
+            )
           }
 
           updateRow(row.id, {
             ...parseOcrFields(text),
-            studentAnswersText: extractStudentAnswerText(text),
+            studentAnswersText: gridAnswersResult
+              ? gridAnswersToText(gridAnswersResult.answers)
+              : extractStudentAnswerText(text),
+            pendingQuestions: gridAnswersResult
+              ? gridAnswersResult.pendingQuestions
+              : [],
             status: '待確認',
-            error: '',
+            error: gridAnswersResult && gridAnswersResult.pendingQuestions.length > 0
+              ? gridCellErrorMessage
+              : '',
           })
         } catch (error) {
           if (ocrRunIdRef.current !== runId) break
           failedCount += 1
           updateRow(row.id, {
             status: '辨識失敗',
-            error: row.isPdf
-              ? error?.message === PDF_SIZE_ERROR
-                ? 'PDF 檔案超過 20 MB，請縮小檔案後再試。'
-                : error?.message === PDF_PAGE_LIMIT_ERROR
-                  ? 'PDF 超過 100 頁，請拆分檔案後再試。'
-                  : pdfErrorMessage
-              : imageErrorMessage,
+            error:
+              error?.message === gridLocateErrorMessage
+                ? gridLocateErrorMessage
+                : row.isPdf
+                  ? error?.message === PDF_SIZE_ERROR
+                    ? 'PDF 檔案超過 20 MB，請縮小檔案後再試。'
+                    : error?.message === PDF_PAGE_LIMIT_ERROR
+                      ? 'PDF 超過 100 頁，請拆分檔案後再試。'
+                      : pdfErrorMessage
+                  : imageErrorMessage,
           })
         } finally {
           if (currentWorkRef.current?.runId === runId) {
@@ -528,6 +714,10 @@ function App() {
           }
           if (activePdfDocumentRef.current === pdfDocument) {
             activePdfDocumentRef.current = null
+          }
+          if (gridSourceCanvas) {
+            gridSourceCanvas.width = 0
+            gridSourceCanvas.height = 0
           }
           if (pdfDocument) {
             try {
@@ -605,6 +795,112 @@ function App() {
     [resultRows, parsedAnswerKey, pointsResult],
   )
 
+  const statistics = useMemo(
+    () =>
+      computeStatistics(
+        resultRows.map((row) => ({
+          grading: gradingByRowId.get(row.id) ?? null,
+          pendingCount: row.pendingQuestions?.length ?? 0,
+        })),
+      ),
+    [resultRows, gradingByRowId],
+  )
+
+  const handleStandardSheetFileChange = (event) => {
+    const [file] = event.target.files ?? []
+    setStandardSheetFile(file ?? null)
+    setStandardSheetStatus(null)
+  }
+
+  const handleStandardSheetOcr = async () => {
+    if (!standardSheetFile) return
+
+    let layout
+    try {
+      layout = createGridLayout({
+        totalQuestions: Number(gridTotalQuestionsText),
+        columns: Number(gridColumnsText),
+      })
+    } catch {
+      setStandardSheetStatus({ type: 'error', message: gridLayoutErrorMessage })
+      return
+    }
+
+    setStandardSheetStatus({ type: 'info', message: '正在辨識標準答案紙…' })
+
+    let worker
+    try {
+      const { createWorker } = await import('tesseract.js')
+      worker = await startOcrWorkerWithFallback({
+        createWorker,
+        baseUrl: import.meta.env.BASE_URL,
+        logger: () => {},
+      })
+
+      const isPdf =
+        standardSheetFile.type === 'application/pdf' ||
+        /\.pdf$/i.test(standardSheetFile.name)
+
+      let canvas
+      if (isPdf) {
+        const pdfData = await standardSheetFile.arrayBuffer()
+        const loadingTask = pdfjsLib.getDocument({ data: pdfData })
+        const pdfDocument = await loadingTask.promise
+        try {
+          const page = await pdfDocument.getPage(1)
+          const initialViewport = page.getViewport({ scale: 1 })
+          const scale = getPdfRenderScale(initialViewport.width, initialViewport.height)
+          const viewport = page.getViewport({ scale })
+          canvas = document.createElement('canvas')
+          canvas.width = Math.ceil(viewport.width)
+          canvas.height = Math.ceil(viewport.height)
+          const context = canvas.getContext('2d')
+          if (!context) throw new Error('Canvas 不支援')
+          await page.render({ canvasContext: context, viewport }).promise
+          page.cleanup()
+        } finally {
+          await pdfDocument.destroy()
+        }
+      } else {
+        canvas = await loadImageFileToCanvas(standardSheetFile)
+      }
+
+      const { answers, pendingQuestions, blankQuestions } = await recognizeGridCells(
+        worker,
+        canvas,
+        layout,
+      )
+      canvas.width = 0
+      canvas.height = 0
+
+      setAnswerKeyText(gridAnswersToText(answers))
+
+      if (pendingQuestions.length > 0 || blankQuestions.length > 0) {
+        const parts = []
+        if (pendingQuestions.length > 0) parts.push(`待確認：第${pendingQuestions.join('、')}題`)
+        if (blankQuestions.length > 0) parts.push(`未作答：第${blankQuestions.join('、')}題`)
+        setStandardSheetStatus({
+          type: 'warning',
+          message: `標準答案紙辨識完成，已填入 ${answers.size} 題，但有${parts.join('；')}，請人工確認。`,
+        })
+      } else {
+        setStandardSheetStatus({
+          type: 'success',
+          message: `標準答案紙辨識完成，已自動填入 ${answers.size} 題標準答案，請確認後使用。`,
+        })
+      }
+    } catch (error) {
+      console.error('標準答案紙 OCR 失敗：', error)
+      setStandardSheetStatus({ type: 'error', message: gridLocateErrorMessage })
+    } finally {
+      if (worker) {
+        try {
+          await worker.terminate()
+        } catch {}
+      }
+    }
+  }
+
   const handleExport = () => {
     try {
       const now = new Date()
@@ -613,8 +909,12 @@ function App() {
           buildExportRow(row, parsedAnswerKey, pointsResult.points),
         ),
       )
+      const statisticsWorksheet = xlsxModule.utils.json_to_sheet([
+        formatStatisticsSummary(statistics),
+      ])
       const workbook = xlsxModule.utils.book_new()
       xlsxModule.utils.book_append_sheet(workbook, worksheet, '批改結果')
+      xlsxModule.utils.book_append_sheet(workbook, statisticsWorksheet, '統計摘要')
 
       const date = [
         now.getFullYear(),
@@ -623,7 +923,7 @@ function App() {
       ].join('-')
 
       xlsxModule.writeFile(workbook, `考卷批改結果-${date}.xlsx`)
-      setExportStatus({ type: 'success', message: 'Excel 檔案已成功匯出。' })
+      setExportStatus({ type: 'success', message: 'Excel 檔案已成功匯出，包含批改結果與統計摘要。' })
     } catch {
       setExportStatus({
         type: 'error',
@@ -692,6 +992,85 @@ function App() {
       </section>
 
       <section className="card">
+        <h2>固定格子答案紙 OCR（標準答案／學生答案）</h2>
+        <p className="hint">
+          三個階段：① 標準答案 OCR → ② 學生答案 OCR → ③ 比對與統計。此模式不辨識自由書寫文字，
+          只針對固定格子中的單一字元進行 A/B/C/D 分類，無法清楚判讀時會標示「待確認」，不會猜測。
+        </p>
+        <label htmlFor="grid-mode-toggle">
+          <input
+            id="grid-mode-toggle"
+            type="checkbox"
+            checked={gridMode}
+            onChange={(event) => setGridMode(event.target.checked)}
+          />
+          {' '}使用固定格子答案紙模式（標準答案與學生答案皆為固定格子 A/B/C/D）
+        </label>
+        {gridMode && (
+          <>
+            <div className="grid-settings">
+              <label htmlFor="grid-total-questions">總題數</label>
+              <input
+                id="grid-total-questions"
+                type="number"
+                min="1"
+                step="1"
+                value={gridTotalQuestionsText}
+                onChange={(event) => setGridTotalQuestionsText(event.target.value)}
+              />
+              <label htmlFor="grid-columns">每列格數</label>
+              <input
+                id="grid-columns"
+                type="number"
+                min="1"
+                step="1"
+                value={gridColumnsText}
+                onChange={(event) => setGridColumnsText(event.target.value)}
+              />
+            </div>
+            <h3>階段一：標準答案 OCR</h3>
+            <label htmlFor="standard-sheet-file">上傳固定格子標準答案紙（單張影像或 PDF）</label>
+            <input
+              id="standard-sheet-file"
+              type="file"
+              accept=".jpg,.jpeg,.png,.pdf,image/jpeg,image/png,application/pdf"
+              onChange={handleStandardSheetFileChange}
+            />
+            <div className="result-actions">
+              <button
+                type="button"
+                onClick={handleStandardSheetOcr}
+                disabled={!standardSheetFile || standardSheetStatus?.type === 'info'}
+              >
+                標準答案 OCR
+              </button>
+            </div>
+            <div id="standard-sheet-status" aria-live="polite">
+              {standardSheetStatus && (
+                <p
+                  className={
+                    standardSheetStatus.type === 'error'
+                      ? 'error-message'
+                      : standardSheetStatus.type === 'warning'
+                        ? 'hint'
+                        : 'success-message'
+                  }
+                  role={standardSheetStatus.type === 'error' ? 'alert' : 'status'}
+                >
+                  {standardSheetStatus.message}
+                </p>
+              )}
+            </div>
+            <p className="hint">
+              階段二「學生答案 OCR」：在下方「上傳考卷檔案」選擇學生固定格子答案紙後，按「開始
+              OCR」即會以相同格子版面逐格辨識學生答案。階段三「比對與統計」：辨識完成後會自動與標準答案比對，
+              並於下方統計摘要顯示整體結果。
+            </p>
+          </>
+        )}
+      </section>
+
+      <section className="card">
         <h2>上傳考卷檔案</h2>
         <label htmlFor="exam-files">選擇考卷檔案</label>
         <input
@@ -703,6 +1082,7 @@ function App() {
         />
         <p className="hint">
           支援格式：JPG、JPEG、PNG、PDF。PDF 限制為 20 MB、最多 100 頁；系統會逐頁轉換與辨識。
+          {gridMode && '目前為固定格子答案紙模式，僅會辨識每題格子中的 A/B/C/D，PDF 僅使用第一頁。'}
         </p>
       </section>
 
@@ -863,6 +1243,20 @@ function App() {
       </section>
 
       <section className="card">
+        <h2>統計摘要</h2>
+        <p role="status" aria-live="polite">
+          總人數 {statistics.totalStudents}、已計分 {statistics.gradedCount} 人、平均分{' '}
+          {statistics.averageScore ?? '—'}、最高分 {statistics.highestScore ?? '—'}、最低分{' '}
+          {statistics.lowestScore ?? '—'}、總已作答題數 {statistics.totalAnsweredQuestions}、
+          待確認 {statistics.rowsWithPending} 人（共 {statistics.totalPendingCells} 格）、
+          辨識成功率{' '}
+          {statistics.recognitionSuccessRate === null
+            ? '—'
+            : `${statistics.recognitionSuccessRate}%`}
+        </p>
+      </section>
+
+      <section className="card">
         <h2>使用注意事項</h2>
         <ul>
           <li>
@@ -884,6 +1278,11 @@ function App() {
           </li>
           <li>
             標準答案與學生答案皆須人工確認；未作答或無法辨識的題目不計為答對。
+          </li>
+          <li>
+            固定格子答案紙模式：版面為題號固定、每格只限填一個 A/B/C/D
+            答案的格子版面，系統先定位版面格子再逐格辨識，不是自由書寫文字
+            OCR；答案模糊或無法判讀時標示「待確認」，絕不猜測；PDF 僅使用第一頁。
           </li>
         </ul>
       </section>

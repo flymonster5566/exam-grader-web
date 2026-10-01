@@ -113,6 +113,23 @@ label {
   max-width: 100%;
 }
 
+.grid-settings {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.grid-settings label {
+  margin: 0;
+}
+
+.grid-settings input[type='number'] {
+  width: 80px;
+  max-width: 80px;
+}
+
 .error-message {
   color: #b91c1c;
   margin: 8px 0 0;
