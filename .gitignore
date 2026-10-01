@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Generated same-site OCR assets (worker/core/lang data copied from
+# node_modules by scripts/copy-ocr-assets.mjs); regenerated on dev/build/test.
+public/ocr
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

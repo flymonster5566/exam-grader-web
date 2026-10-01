@@ -15,6 +15,11 @@ import {
   parsePointsPerQuestion,
   parseStudentAnswers,
 } from './grading.js'
+import {
+  buildSameSiteWorkerOptions,
+  classifyOcrStartupError,
+  shouldAttemptCdnFallback,
+} from './ocrAssets.js'
 import { APP_VERSION } from './version.js'
 import './App.css'
 
@@ -79,6 +84,87 @@ function buildExportRow(row, parsedAnswerKey, pointsPerQuestion) {
     錯題清單: grading ? formatWrongQuestions(grading.wrongQuestions) : '—',
     狀態: displayRowStatus(row, grading),
   }
+}
+
+// tesseract.js v7's `createWorker` promise only rejects when the *core*
+// fails to load; a failed language-data fetch is only reported through the
+// worker's internal message handler and otherwise leaves the returned
+// promise pending forever. Racing it against an `errorHandler`-driven
+// rejection ensures language load failures (and any other worker-reported
+// error) surface instead of hanging indefinitely.
+function createOcrWorker(createWorker, options) {
+  let startupRejected = false
+  // Set synchronously inside the rejecting call itself (rather than relying
+  // on `startupFailure`'s `.catch()` callback having already run) so the
+  // flag is correct even if `workerPromise` resolves in the same microtask
+  // tick as the rejection.
+  const rejectStartup = (error) => {
+    startupRejected = true
+    rejectStartupPromise(error)
+  }
+  let rejectStartupPromise
+  const startupFailure = new Promise((_resolve, reject) => {
+    rejectStartupPromise = reject
+  })
+  // If the worker starts successfully, `startupFailure` has already lost the
+  // race below but keeps living (the `errorHandler` option stays attached
+  // for the worker's full lifetime). Without this, a later job failure could
+  // reject it with nothing listening, producing an unhandled rejection.
+  startupFailure.catch(() => {})
+  const workerPromise = createWorker(['chi_tra', 'eng'], undefined, {
+    ...options,
+    errorHandler: (error) => rejectStartup(error),
+  })
+  // If startup is ultimately reported as failed (e.g. language data failed
+  // to load) but the underlying worker thread still ends up resolving later
+  // (tesseract.js's `createWorker` promise can remain pending well past the
+  // point the errorHandler already fired), terminate it instead of leaking
+  // it silently, since nothing else references this worker in that case.
+  workerPromise.then((worker) => {
+    if (startupRejected) {
+      worker.terminate().catch(() => {})
+    }
+  }, () => {})
+  return Promise.race([workerPromise, startupFailure])
+}
+
+// Attempts to start the OCR worker using same-site assets first, falling
+// back to the default CDN options (at most once, via `shouldAttemptCdnFallback`)
+// only if the same-site attempt failed. Returns the worker on success, or
+// throws the last error if both attempts failed.
+async function startOcrWorkerWithFallback({
+  createWorker,
+  baseUrl,
+  logger,
+  onFallbackStart,
+}) {
+  const sameSiteOptions = buildSameSiteWorkerOptions(baseUrl)
+  let fallbackAttempted = false
+  let lastError = null
+  try {
+    return await createOcrWorker(createWorker, {
+      cacheMethod: 'none',
+      ...sameSiteOptions,
+      logger,
+    })
+  } catch (sameSiteError) {
+    lastError = sameSiteError
+  }
+
+  if (shouldAttemptCdnFallback({ sameSiteFailed: true, fallbackAttempted })) {
+    fallbackAttempted = true
+    onFallbackStart?.(lastError)
+    try {
+      return await createOcrWorker(createWorker, {
+        cacheMethod: 'none',
+        logger,
+      })
+    } catch (fallbackError) {
+      lastError = fallbackError
+    }
+  }
+
+  throw lastError
 }
 
 function App() {
@@ -212,10 +298,11 @@ function App() {
     ocrRunIdRef.current = runId
     let worker
     let failedCount = 0
+    let ocrStartupSettled = false
 
     setOcrStatus({
       running: true,
-      message: '正在載入 OCR 引擎與繁體中文辨識資料…',
+      message: '正在載入本機 OCR 引擎與繁體中文辨識資料…',
       fileName: ocrRows[0].fileName,
       progress: 0,
       pageNumber: null,
@@ -226,40 +313,69 @@ function App() {
     try {
       const { createWorker } = await import('tesseract.js')
       if (ocrRunIdRef.current !== runId) return
-      worker = await createWorker(['chi_tra', 'eng'], undefined, {
-        cacheMethod: 'none',
-        logger: ({ status, progress }) => {
-          if (ocrRunIdRef.current !== runId) return
-          const currentWork = currentWorkRef.current
-          const pageProgress = Math.round(progress * 100)
-          const fileProgress = currentWork
-            ? ((currentWork.pageNumber - 1 + progress) /
-                currentWork.totalPages) *
-              100
-            : progress * 100
-          const message =
-            status === 'recognizing text'
-              ? currentWork?.isPdf
-                ? `正在辨識 PDF 第 ${currentWork.pageNumber} 頁…`
-                : '正在辨識圖片…'
-              : `正在載入 OCR 資料：${status}`
-          setOcrStatus({
-            running: true,
-            message,
-            fileName: currentWork?.fileName ?? ocrRows[0].fileName,
-            progress: currentWork
-              ? calculateOverallProgress(
-                  currentWork.fileIndex,
-                  ocrRows.length,
-                  fileProgress,
-                )
-              : null,
-            pageNumber: currentWork?.isPdf ? currentWork.pageNumber : null,
-            totalPages: currentWork?.isPdf ? currentWork.totalPages : null,
-            pageProgress: currentWork?.isPdf ? pageProgress : null,
-          })
-        },
-      })
+
+      const ocrWorkerLogger = ({ status, progress }) => {
+        if (ocrRunIdRef.current !== runId) return
+        // Ignore stale "loading" events from an abandoned worker attempt
+        // (e.g. a same-site attempt still finishing in the background after
+        // we've already moved on to a CDN fallback or failed outright).
+        if (status !== 'recognizing text' && ocrStartupSettled) return
+        const currentWork = currentWorkRef.current
+        const pageProgress = Math.round(progress * 100)
+        const fileProgress = currentWork
+          ? ((currentWork.pageNumber - 1 + progress) /
+              currentWork.totalPages) *
+            100
+          : progress * 100
+        const message =
+          status === 'recognizing text'
+            ? currentWork?.isPdf
+              ? `正在辨識 PDF 第 ${currentWork.pageNumber} 頁…`
+              : '正在辨識圖片…'
+            : `正在載入 OCR 資料：${status}`
+        setOcrStatus({
+          running: true,
+          message,
+          fileName: currentWork?.fileName ?? ocrRows[0].fileName,
+          progress: currentWork
+            ? calculateOverallProgress(
+                currentWork.fileIndex,
+                ocrRows.length,
+                fileProgress,
+              )
+            : null,
+          pageNumber: currentWork?.isPdf ? currentWork.pageNumber : null,
+          totalPages: currentWork?.isPdf ? currentWork.totalPages : null,
+          pageProgress: currentWork?.isPdf ? pageProgress : null,
+        })
+      }
+
+      let startupError = null
+      try {
+        worker = await startOcrWorkerWithFallback({
+          createWorker,
+          baseUrl: import.meta.env.BASE_URL,
+          logger: ocrWorkerLogger,
+          onFallbackStart: (sameSiteError) => {
+            if (ocrRunIdRef.current !== runId) return
+            console.error('同站 OCR 資源載入失敗，改嘗試 CDN 備援資源。', sameSiteError)
+            setOcrStatus({
+              running: true,
+              message: '同站 OCR 資源載入失敗，正在嘗試備援 OCR 資源（CDN）…',
+              fileName: ocrRows[0].fileName,
+              progress: 0,
+              pageNumber: null,
+              totalPages: null,
+              pageProgress: null,
+            })
+          },
+        })
+      } catch (error) {
+        startupError = error
+      }
+
+      ocrStartupSettled = true
+      if (startupError) throw startupError
 
       if (ocrRunIdRef.current !== runId) {
         await worker.terminate()
@@ -280,10 +396,10 @@ function App() {
           pageProgress: null,
         })
 
+        let text
+        let loadingTask
+        let pdfDocument
         try {
-          let text
-          let loadingTask
-          let pdfDocument
           if (row.isPdf) {
             if (row.file.size > MAX_PDF_SIZE) {
               throw new Error(PDF_SIZE_ERROR)
@@ -439,17 +555,20 @@ function App() {
           pageProgress: null,
         })
       }
-    } catch {
+    } catch (error) {
+      ocrStartupSettled = true
       if (ocrRunIdRef.current === runId) {
+        console.error('OCR 引擎啟動失敗：', error)
+        const { message } = classifyOcrStartupError(error)
         for (const row of ocrRows) {
           updateRow(row.id, {
             status: '辨識失敗',
-            error: 'OCR 引擎啟動失敗，請確認網路連線後再試。',
+            error: message,
           })
         }
         setOcrStatus({
           running: false,
-          message: 'OCR 引擎啟動失敗，請確認網路連線後再試。',
+          message,
           fileName: '',
           progress: null,
           pageNumber: null,
