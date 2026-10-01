@@ -94,6 +94,7 @@ function buildExportRow(row, parsedAnswerKey, pointsPerQuestion) {
 // error) surface instead of hanging indefinitely.
 function createOcrWorker(createWorker, options) {
   let rejectStartup
+  let startupRejected = false
   const startupFailure = new Promise((_resolve, reject) => {
     rejectStartup = reject
   })
@@ -101,11 +102,23 @@ function createOcrWorker(createWorker, options) {
   // race below but keeps living (the `errorHandler` option stays attached
   // for the worker's full lifetime). Without this, a later job failure could
   // reject it with nothing listening, producing an unhandled rejection.
-  startupFailure.catch(() => {})
+  startupFailure.catch(() => {
+    startupRejected = true
+  })
   const workerPromise = createWorker(['chi_tra', 'eng'], undefined, {
     ...options,
     errorHandler: (error) => rejectStartup(error),
   })
+  // If startup is ultimately reported as failed (e.g. language data failed
+  // to load) but the underlying worker thread still ends up resolving later
+  // (tesseract.js's `createWorker` promise can remain pending well past the
+  // point the errorHandler already fired), terminate it instead of leaking
+  // it silently, since nothing else references this worker in that case.
+  workerPromise.then((worker) => {
+    if (startupRejected) {
+      worker.terminate().catch(() => {})
+    }
+  }, () => {})
   return Promise.race([workerPromise, startupFailure])
 }
 
