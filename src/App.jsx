@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { parseOcrFields } from './parseOcrFields.js'
@@ -7,6 +7,14 @@ import {
   getPdfRenderScale,
   mergePdfPageTexts,
 } from './pdfOcrUtils.js'
+import {
+  extractStudentAnswerText,
+  formatWrongQuestions,
+  gradeSubmission,
+  parseAnswerKey,
+  parsePointsPerQuestion,
+  parseStudentAnswers,
+} from './grading.js'
 import { APP_VERSION } from './version.js'
 import './App.css'
 
@@ -35,7 +43,7 @@ function createResultRow(file, index) {
     className: '—',
     seatNumber: '—',
     studentName: '—',
-    score: '—',
+    studentAnswersText: '',
     status: isPdf || isImage ? '待辨識' : '格式不支援',
     error: '',
     isPdf,
@@ -43,10 +51,42 @@ function createResultRow(file, index) {
   }
 }
 
+function gradeRow(row, parsedAnswerKey, pointsPerQuestion) {
+  if (!parsedAnswerKey.isValid || pointsPerQuestion === null) return null
+  return gradeSubmission({
+    answerKey: parsedAnswerKey.answerKey,
+    studentAnswers: parseStudentAnswers(row.studentAnswersText),
+    pointsPerQuestion,
+  })
+}
+
+function displayRowStatus(row, grading) {
+  if (row.status === '待確認' && grading) return '已計分'
+  return row.status
+}
+
+function buildExportRow(row, parsedAnswerKey, pointsPerQuestion) {
+  const grading = gradeRow(row, parsedAnswerKey, pointsPerQuestion)
+  return {
+    檔案: row.fileName,
+    班級: row.className,
+    座號: row.seatNumber,
+    姓名: row.studentName,
+    分數: grading ? grading.score : '—',
+    答對題數: grading ? grading.correctCount : '—',
+    總題數: grading ? grading.totalCount : '—',
+    學生答案: row.studentAnswersText || '—',
+    錯題清單: grading ? formatWrongQuestions(grading.wrongQuestions) : '—',
+    狀態: displayRowStatus(row, grading),
+  }
+}
+
 function App() {
   const [resultRows, setResultRows] = useState([])
   const [exportStatus, setExportStatus] = useState(null)
   const [xlsxModule, setXlsxModule] = useState(null)
+  const [answerKeyText, setAnswerKeyText] = useState('')
+  const [pointsPerQuestionText, setPointsPerQuestionText] = useState('1')
   const [ocrStatus, setOcrStatus] = useState({
     running: false,
     message: '',
@@ -346,6 +386,7 @@ function App() {
 
           updateRow(row.id, {
             ...parseOcrFields(text),
+            studentAnswersText: extractStudentAnswerText(text),
             status: '待確認',
             error: '',
           })
@@ -426,22 +467,36 @@ function App() {
     }
   }
 
+  const parsedAnswerKey = useMemo(
+    () => parseAnswerKey(answerKeyText),
+    [answerKeyText],
+  )
+  const pointsResult = useMemo(
+    () => parsePointsPerQuestion(pointsPerQuestionText),
+    [pointsPerQuestionText],
+  )
+  const gradingByRowId = useMemo(
+    () =>
+      new Map(
+        resultRows.map((row) => [
+          row.id,
+          gradeRow(row, parsedAnswerKey, pointsResult.points),
+        ]),
+      ),
+    [resultRows, parsedAnswerKey, pointsResult],
+  )
+
   const handleExport = () => {
     try {
+      const now = new Date()
       const worksheet = xlsxModule.utils.json_to_sheet(
-        resultRows.map((row) => ({
-          檔案: row.fileName,
-          班級: row.className,
-          座號: row.seatNumber,
-          姓名: row.studentName,
-          分數: row.score,
-          狀態: row.status,
-        })),
+        resultRows.map((row) =>
+          buildExportRow(row, parsedAnswerKey, pointsResult.points),
+        ),
       )
       const workbook = xlsxModule.utils.book_new()
       xlsxModule.utils.book_append_sheet(workbook, worksheet, '批改結果')
 
-      const now = new Date()
       const date = [
         now.getFullYear(),
         String(now.getMonth() + 1).padStart(2, '0'),
@@ -467,6 +522,55 @@ function App() {
   return (
     <main className="app">
       <h1>考卷批改系統（MVP）</h1>
+
+      <section className="card">
+        <h2>標準答案設定</h2>
+        <p className="hint">
+          目前僅支援選擇題，格式為每行一題「題號:答案」，例如：
+        </p>
+        <pre className="answer-key-example">{'1:A\n2:C\n3:B'}</pre>
+        <p className="hint">僅接受 A、B、C、D，題號需從 1 開始連續且不可重複或空白。</p>
+        <label htmlFor="answer-key-input">標準答案</label>
+        <textarea
+          id="answer-key-input"
+          rows={6}
+          value={answerKeyText}
+          onChange={(event) => setAnswerKeyText(event.target.value)}
+          aria-describedby="answer-key-status"
+        />
+        <label htmlFor="points-per-question">每題配分</label>
+        <input
+          id="points-per-question"
+          type="number"
+          min="0"
+          step="any"
+          value={pointsPerQuestionText}
+          onChange={(event) => setPointsPerQuestionText(event.target.value)}
+          aria-describedby="answer-key-status"
+        />
+        <div id="answer-key-status" aria-live="polite">
+          {pointsResult.error && (
+            <p className="error-message" role="alert">
+              {pointsResult.error}
+            </p>
+          )}
+          {parsedAnswerKey.errors.length > 0 && (
+            <ul className="error-message" role="alert">
+              {parsedAnswerKey.errors.map((message) => (
+                <li key={message}>{message}</li>
+              ))}
+            </ul>
+          )}
+          {parsedAnswerKey.isValid && (
+            <p className="success-message">
+              已解析 {parsedAnswerKey.totalQuestions} 題標準答案：
+              {[...parsedAnswerKey.answerKey.entries()]
+                .map(([questionNumber, answer]) => `${questionNumber}:${answer}`)
+                .join('、')}
+            </p>
+          )}
+        </div>
+      </section>
 
       <section className="card">
         <h2>上傳考卷檔案</h2>
@@ -554,57 +658,85 @@ function App() {
                 <th>座號</th>
                 <th>姓名</th>
                 <th>分數</th>
+                <th>答對題數</th>
+                <th>學生答案</th>
                 <th>狀態</th>
               </tr>
             </thead>
             <tbody>
               {resultRows.length === 0 ? (
                 <tr>
-                  <td colSpan="6">尚無資料</td>
+                  <td colSpan="8">尚無資料</td>
                 </tr>
               ) : (
-                resultRows.map((row) => (
-                  <tr key={row.id}>
-                    <td>{row.fileName}</td>
-                    <td>
-                      <input
-                        aria-label={`${row.fileName}的班級`}
-                        type="text"
-                        value={row.className}
-                        onChange={(event) =>
-                          updateRow(row.id, { className: event.target.value })
-                        }
-                      />
-                    </td>
-                    <td>
-                      <input
-                        aria-label={`${row.fileName}的座號`}
-                        type="text"
-                        value={row.seatNumber}
-                        onChange={(event) =>
-                          updateRow(row.id, { seatNumber: event.target.value })
-                        }
-                      />
-                    </td>
-                    <td>
-                      <input
-                        aria-label={`${row.fileName}的姓名`}
-                        type="text"
-                        value={row.studentName}
-                        onChange={(event) =>
-                          updateRow(row.id, { studentName: event.target.value })
-                        }
-                      />
-                    </td>
-                    <td>{row.score}</td>
-                    <td>
-                      {row.status}
-                      {row.error && (
-                        <small className="row-error">{row.error}</small>
-                      )}
-                    </td>
-                  </tr>
-                ))
+                resultRows.map((row) => {
+                  const grading = gradingByRowId.get(row.id) ?? null
+                  return (
+                    <tr key={row.id}>
+                      <td>{row.fileName}</td>
+                      <td>
+                        <input
+                          aria-label={`${row.fileName}的班級`}
+                          type="text"
+                          value={row.className}
+                          onChange={(event) =>
+                            updateRow(row.id, { className: event.target.value })
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label={`${row.fileName}的座號`}
+                          type="text"
+                          value={row.seatNumber}
+                          onChange={(event) =>
+                            updateRow(row.id, { seatNumber: event.target.value })
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label={`${row.fileName}的姓名`}
+                          type="text"
+                          value={row.studentName}
+                          onChange={(event) =>
+                            updateRow(row.id, { studentName: event.target.value })
+                          }
+                        />
+                      </td>
+                      <td>{grading ? `${grading.score} 分` : '—'}</td>
+                      <td>
+                        {grading
+                          ? `${grading.correctCount}/${grading.totalCount}（已作答 ${grading.answeredCount}）`
+                          : '—'}
+                      </td>
+                      <td>
+                        <label
+                          className="visually-hidden"
+                          htmlFor={`student-answers-${row.id}`}
+                        >
+                          {`${row.fileName}的學生答案`}
+                        </label>
+                        <textarea
+                          id={`student-answers-${row.id}`}
+                          rows={3}
+                          value={row.studentAnswersText}
+                          onChange={(event) =>
+                            updateRow(row.id, {
+                              studentAnswersText: event.target.value,
+                            })
+                          }
+                        />
+                      </td>
+                      <td>
+                        {displayRowStatus(row, grading)}
+                        {row.error && (
+                          <small className="row-error">{row.error}</small>
+                        )}
+                      </td>
+                    </tr>
+                  )
+                })
               )}
             </tbody>
           </table>
@@ -625,14 +757,22 @@ function App() {
           <li>
             系統僅嘗試擷取「班級」、「座號」、「姓名」標籤旁的文字；無法解析時會保留「—」。
           </li>
-          <li>答案辨識與自動計分尚未實作，分數欄位維持「—」。</li>
+          <li>
+            系統僅嘗試從 OCR 文字擷取「題號:答案」格式的選擇題答案；無法可靠解析時保留空白，不會自動猜測。
+          </li>
+          <li>
+            第一版僅支援選擇題 A、B、C、D 的自動計分，且每題配分固定相同；尚未支援非選擇題、手寫答案或其他題型的自動批改。
+          </li>
+          <li>
+            標準答案與學生答案皆須人工確認；未作答或無法辨識的題目不計為答對。
+          </li>
         </ul>
       </section>
 
       <section className="card">
         <h2>隱私說明</h2>
         <p>
-          PDF／圖片與 OCR 結果只在瀏覽器記憶體中處理，不會上傳考卷或結果，也不使用
+          PDF／圖片、OCR 結果、標準答案與計分結果只在瀏覽器記憶體中處理，不會上傳考卷或結果，也不使用
           localStorage。PDF.js 與 worker 隨網站部署；首次辨識時，瀏覽器會從 jsDelivr 載入 Tesseract.js OCR 引擎與語言資料。CDN 僅提供程式及語言資源，檔案內容與 OCR 結果不會傳送給 CDN。
         </p>
       </section>
