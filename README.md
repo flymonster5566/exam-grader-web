@@ -25,6 +25,7 @@
 - **自動計分**：標準答案與學生答案皆有效時，即時計算分數、答對題數與已作答題數；標準答案或配分修改後立即重新計算
 - 可在瀏覽器端將目前結果表格匯出為 Excel `.xlsx` 檔案，內容包含分數、答對題數、總題數、學生答案與錯題清單
 - 圖片、OCR 文字、標準答案與計分結果僅在瀏覽器記憶體中處理，不上傳伺服器、不使用 `localStorage`
+- OCR 引擎（worker／core）與 `chi_tra`、`eng` 語言資料優先由 GitHub Pages 同站資源載入，不以外部 CDN 為唯一來源（詳見下方「OCR 資源來源」）
 - 首頁包含「使用注意事項」與「隱私說明」
 - 左下角版本與此處版本皆由 `package.json` 的 version 欄位產生
 
@@ -51,13 +52,21 @@
 - 分數 = 答對題數 × 每題配分；表格另外顯示「答對題數/總題數（已作答 N）」。
 - OCR 完成後狀態先顯示「待確認」；當標準答案有效時，畫面會自動顯示為「已計分」，且會隨標準答案、配分或學生答案的任何修改立即重新計算。
 
+## OCR 資源來源
+
+- Tesseract.js 的 worker（`worker.min.js`）、單一 WASM core 變體（LSTM-only，`tesseract-core-lstm.wasm.js` / `.wasm`）以及 `chi_tra`、`eng`（LSTM-only「best_int」版本）語言資料，於 `npm run dev`／`npm run build`／`npm run test` 前由 `scripts/copy-ocr-assets.mjs` 自動從 `node_modules`（`tesseract.js`、`tesseract.js-core`、`@tesseract.js-data/chi_tra`、`@tesseract.js-data/eng`）複製到 `public/ocr/`，再由 Vite 以同站靜態資源建置部署，不會提交到 Git（見 `.gitignore`）。
+- 瀏覽器端以 `import.meta.env.BASE_URL` 組出 `${BASE_URL}ocr/...` 的絕對路徑（例如正式站為 `/exam-grader-web/ocr/...`），並透過 `createWorker` 的 `workerPath`、`corePath`、`langPath` 選項指向這些同站資源，避免 GitHub Pages 專案網站的 base path 造成 404。對應邏輯與測試見 `src/ocrAssets.js`、`src/ocrAssets.test.js`。
+- 若同站資源確實載入失敗（例如部署問題或快取異常），系統會先在畫面上顯示「正在嘗試備援 OCR 資源（CDN）…」，再嘗試 Tesseract.js 預設的 jsDelivr CDN 作為備援；CDN 只會下載 OCR 程式與語言模型本身，不會上傳、也不會傳送考卷檔案、答案或辨識結果。若同站與備援皆失敗，才會顯示具體錯誤分類（見下方）。
+- 這些同站 OCR 資源首次載入約 12 MB（worker 約 0.1 MB、WASM core 約 6.6 MB、`chi_tra`＋`eng` 語言資料約 4.5 MB），僅在首次於瀏覽器啟動 OCR 時下載；之後視瀏覽器快取情形可能重複使用，不會每次辨識都重新下載。考量到儲存庫與建置產物大小，這些二進位資源不直接提交到 Git，而是在建置時由上述 npm 套件重新產生，GitHub Actions 的 `npm ci && npm run build` 流程會自動完成此步驟。
+
 ## OCR 限制與隱私
 
 - 支援 JPG、JPEG、PNG 與 PDF。PDF 每頁轉成影像後逐頁執行 OCR，不使用 PDF 文字層；單一 PDF 不超過 20 MB 且最多 100 頁。
 - 辨識準確率會受圖片清晰度、方向及版面影響，OCR 結果必須人工確認；系統不會自動批改或保證正確。
 - 系統僅依「班級」、「座號」、「姓名」標籤解析文字；未能可靠解析時保留「—」，每筆結果均須人工確認。
 - 系統僅依「題號:答案」格式解析選擇題學生答案；未能可靠解析時保留空白，每筆結果均須人工確認。
-- PDF.js 及其 worker 隨網站建置並部署於 GitHub Pages；首次 OCR 會從 jsDelivr 載入 Tesseract.js OCR 引擎與繁體中文／英文語言資料。瀏覽器會向 CDN 請求程式與語言資源，但 PDF／圖片檔案及 OCR 結果只在瀏覽器記憶體處理，不會傳送至 CDN 或任何伺服器。
+- PDF.js 及其 worker、Tesseract.js OCR 引擎與繁體中文／英文語言資料皆優先隨網站同站部署於 GitHub Pages；僅在同站資源確實載入失敗時才會嘗試 jsDelivr CDN 備援。無論同站或 CDN，瀏覽器只會下載 OCR 程式與語言資源，PDF／圖片檔案及 OCR 結果只在瀏覽器記憶體處理，不會傳送至 CDN 或任何伺服器。
+- OCR 啟動失敗時，畫面會區分顯示「OCR 引擎程式資源無法載入」「OCR 引擎初始化失敗」「語言資料載入失敗」等具體分類與建議動作（重新整理、確認網路連線或聯絡系統管理者），技術細節（例如完整錯誤訊息）僅輸出至開發者主控台，不在畫面上顯示內部資源網址。單一圖片或 PDF 頁面辨識失敗則維持原有「圖片無法讀取或 OCR 辨識失敗」「PDF 頁面無法讀取或 OCR 辨識失敗」提示，不影響其他檔案繼續辨識。
 - 標準答案、學生答案與計分結果只存在目前頁面的記憶體中；重新整理或離開頁面後不會保留，也不會上傳或儲存於 `localStorage`。
 - 第一版僅支援選擇題（A/B/C/D）自動計分；尚未支援非選擇題、手寫作答或其他題型的自動批改。
 
@@ -72,7 +81,7 @@ npm install
 npm run dev
 ```
 
-安裝相依套件後，首次啟動 OCR 需要網路連線下載 OCR 引擎與語言資料。
+`npm install` 會安裝 OCR 引擎、核心與語言資料套件；`npm run dev`（與 `build`、`test`）會先執行 `scripts/copy-ocr-assets.mjs`，將這些資源複製到 `public/ocr/`，所以本機啟動 OCR 不需要連線到外部 CDN。僅當同站資源意外載入失敗時，才會嘗試連線 jsDelivr CDN 作為備援。
 
 ## 建置
 
@@ -89,7 +98,7 @@ npm run build
 npm audit
 ```
 
-`npm run test` 使用 Node.js 內建測試執行器，驗證欄位標籤解析、版本來源、PDF 頁面文字合併、進度計算、渲染尺寸限制，以及標準答案解析、學生答案解析與自動計分（含未作答不算對、不同配分、修改答案後重新計分等情境）。
+`npm run test` 使用 Node.js 內建測試執行器，驗證欄位標籤解析、版本來源、PDF 頁面文字合併、進度計算、渲染尺寸限制，以及標準答案解析、學生答案解析與自動計分（含未作答不算對、不同配分、修改答案後重新計分等情境）、GitHub Pages base path 下 OCR 同站資源 URL 的組建，以及 OCR 啟動錯誤分類與 CDN 備援判斷邏輯。
 
 ## GitHub Pages 自動部署
 

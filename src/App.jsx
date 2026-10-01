@@ -15,6 +15,11 @@ import {
   parsePointsPerQuestion,
   parseStudentAnswers,
 } from './grading.js'
+import {
+  buildSameSiteWorkerOptions,
+  classifyOcrStartupError,
+  shouldAttemptCdnFallback,
+} from './ocrAssets.js'
 import { APP_VERSION } from './version.js'
 import './App.css'
 
@@ -79,6 +84,24 @@ function buildExportRow(row, parsedAnswerKey, pointsPerQuestion) {
     錯題清單: grading ? formatWrongQuestions(grading.wrongQuestions) : '—',
     狀態: displayRowStatus(row, grading),
   }
+}
+
+// tesseract.js v7's `createWorker` promise only rejects when the *core*
+// fails to load; a failed language-data fetch is only reported through the
+// worker's internal message handler and otherwise leaves the returned
+// promise pending forever. Racing it against an `errorHandler`-driven
+// rejection ensures language load failures (and any other worker-reported
+// error) surface instead of hanging indefinitely.
+function createOcrWorker(createWorker, options) {
+  let rejectStartup
+  const startupFailure = new Promise((_resolve, reject) => {
+    rejectStartup = reject
+  })
+  const workerPromise = createWorker(['chi_tra', 'eng'], undefined, {
+    ...options,
+    errorHandler: (error) => rejectStartup(error),
+  })
+  return Promise.race([workerPromise, startupFailure])
 }
 
 function App() {
@@ -212,10 +235,11 @@ function App() {
     ocrRunIdRef.current = runId
     let worker
     let failedCount = 0
+    let ocrStartupSettled = false
 
     setOcrStatus({
       running: true,
-      message: '正在載入 OCR 引擎與繁體中文辨識資料…',
+      message: '正在載入本機 OCR 引擎與繁體中文辨識資料…',
       fileName: ocrRows[0].fileName,
       progress: 0,
       pageNumber: null,
@@ -226,40 +250,86 @@ function App() {
     try {
       const { createWorker } = await import('tesseract.js')
       if (ocrRunIdRef.current !== runId) return
-      worker = await createWorker(['chi_tra', 'eng'], undefined, {
-        cacheMethod: 'none',
-        logger: ({ status, progress }) => {
-          if (ocrRunIdRef.current !== runId) return
-          const currentWork = currentWorkRef.current
-          const pageProgress = Math.round(progress * 100)
-          const fileProgress = currentWork
-            ? ((currentWork.pageNumber - 1 + progress) /
-                currentWork.totalPages) *
-              100
-            : progress * 100
-          const message =
-            status === 'recognizing text'
-              ? currentWork?.isPdf
-                ? `正在辨識 PDF 第 ${currentWork.pageNumber} 頁…`
-                : '正在辨識圖片…'
-              : `正在載入 OCR 資料：${status}`
-          setOcrStatus({
-            running: true,
-            message,
-            fileName: currentWork?.fileName ?? ocrRows[0].fileName,
-            progress: currentWork
-              ? calculateOverallProgress(
-                  currentWork.fileIndex,
-                  ocrRows.length,
-                  fileProgress,
-                )
-              : null,
-            pageNumber: currentWork?.isPdf ? currentWork.pageNumber : null,
-            totalPages: currentWork?.isPdf ? currentWork.totalPages : null,
-            pageProgress: currentWork?.isPdf ? pageProgress : null,
+
+      const ocrWorkerLogger = ({ status, progress }) => {
+        if (ocrRunIdRef.current !== runId) return
+        // Ignore stale "loading" events from an abandoned worker attempt
+        // (e.g. a same-site attempt still finishing in the background after
+        // we've already moved on to a CDN fallback or failed outright).
+        if (status !== 'recognizing text' && ocrStartupSettled) return
+        const currentWork = currentWorkRef.current
+        const pageProgress = Math.round(progress * 100)
+        const fileProgress = currentWork
+          ? ((currentWork.pageNumber - 1 + progress) /
+              currentWork.totalPages) *
+            100
+          : progress * 100
+        const message =
+          status === 'recognizing text'
+            ? currentWork?.isPdf
+              ? `正在辨識 PDF 第 ${currentWork.pageNumber} 頁…`
+              : '正在辨識圖片…'
+            : `正在載入 OCR 資料：${status}`
+        setOcrStatus({
+          running: true,
+          message,
+          fileName: currentWork?.fileName ?? ocrRows[0].fileName,
+          progress: currentWork
+            ? calculateOverallProgress(
+                currentWork.fileIndex,
+                ocrRows.length,
+                fileProgress,
+              )
+            : null,
+          pageNumber: currentWork?.isPdf ? currentWork.pageNumber : null,
+          totalPages: currentWork?.isPdf ? currentWork.totalPages : null,
+          pageProgress: currentWork?.isPdf ? pageProgress : null,
+        })
+      }
+
+      const sameSiteOptions = buildSameSiteWorkerOptions(import.meta.env.BASE_URL)
+      let startupError = null
+      try {
+        worker = await createOcrWorker(createWorker, {
+          cacheMethod: 'none',
+          ...sameSiteOptions,
+          logger: ocrWorkerLogger,
+        })
+      } catch (sameSiteError) {
+        startupError = sameSiteError
+      }
+
+      if (
+        !worker &&
+        shouldAttemptCdnFallback({
+          sameSiteFailed: Boolean(startupError),
+          fallbackAttempted: false,
+        })
+      ) {
+        if (ocrRunIdRef.current !== runId) return
+        console.error('同站 OCR 資源載入失敗，改嘗試 CDN 備援資源。', startupError)
+        setOcrStatus({
+          running: true,
+          message: '同站 OCR 資源載入失敗，正在嘗試備援 OCR 資源（CDN）…',
+          fileName: ocrRows[0].fileName,
+          progress: 0,
+          pageNumber: null,
+          totalPages: null,
+          pageProgress: null,
+        })
+        try {
+          worker = await createOcrWorker(createWorker, {
+            cacheMethod: 'none',
+            logger: ocrWorkerLogger,
           })
-        },
-      })
+          startupError = null
+        } catch (fallbackError) {
+          startupError = fallbackError
+        }
+      }
+
+      ocrStartupSettled = true
+      if (startupError) throw startupError
 
       if (ocrRunIdRef.current !== runId) {
         await worker.terminate()
@@ -280,10 +350,10 @@ function App() {
           pageProgress: null,
         })
 
+        let text
+        let loadingTask
+        let pdfDocument
         try {
-          let text
-          let loadingTask
-          let pdfDocument
           if (row.isPdf) {
             if (row.file.size > MAX_PDF_SIZE) {
               throw new Error(PDF_SIZE_ERROR)
@@ -439,17 +509,20 @@ function App() {
           pageProgress: null,
         })
       }
-    } catch {
+    } catch (error) {
+      ocrStartupSettled = true
       if (ocrRunIdRef.current === runId) {
+        console.error('OCR 引擎啟動失敗：', error)
+        const { message } = classifyOcrStartupError(error)
         for (const row of ocrRows) {
           updateRow(row.id, {
             status: '辨識失敗',
-            error: 'OCR 引擎啟動失敗，請確認網路連線後再試。',
+            error: message,
           })
         }
         setOcrStatus({
           running: false,
-          message: 'OCR 引擎啟動失敗，請確認網路連線後再試。',
+          message,
           fileName: '',
           progress: null,
           pageNumber: null,

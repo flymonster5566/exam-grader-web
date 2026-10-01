@@ -5,12 +5,13 @@
   "type": "module",
   "scripts": {
     "version:sync": "node scripts/generate-version.mjs",
-    "predev": "npm run version:sync",
+    "ocr-assets:sync": "node scripts/copy-ocr-assets.mjs",
+    "predev": "npm run version:sync && npm run ocr-assets:sync",
     "dev": "vite",
-    "prebuild": "npm run version:sync",
+    "prebuild": "npm run version:sync && npm run ocr-assets:sync",
     "build": "vite build",
     "lint": "oxlint",
-    "pretest": "npm run version:sync",
+    "pretest": "npm run version:sync && npm run ocr-assets:sync",
     "test": "node --test",
     "preview": "vite preview"
   },
@@ -22,6 +23,8 @@
     "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
+    "@tesseract.js-data/chi_tra": "^1.0.0",
+    "@tesseract.js-data/eng": "^1.0.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
